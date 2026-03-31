@@ -422,13 +422,6 @@ books/
 
 ---
 
-## 📄 License
-
-MIT License
-```
-
----
-
 ## example.json（JSON 模板）
 
 放置路径：`data/plugin_data/world_book/books/example.json`
