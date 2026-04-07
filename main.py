@@ -3,15 +3,22 @@ World Book Plugin for KiraAI
 =============================
 根据对话中的关键词自动将世界书条目注入 LLM 上下文。
 
-v1.1 修复：
-  - 仅扫描用户消息，不扫描 AI 回复，避免循环触发
+v1.2修复：
+  - 常驻条目在无用户文本时仍能注入
+  - data_dir 空值防御
+  - 并发 reload 安全（原子替换）
+  - 配置值类型安全转换
+  - scan_depth 解析校验
+  - _find_persona_idx 默认值修正
+  - 仅扫描用户消息，不扫描 AI 回复
   - 支持条目级别 scan_depth，带缓存
   - 二级关键词仅基于用户文本 + 已激活条目内容匹配
-  - 改进日志，显示匹配原因
+  - 增加最大递归深度
 """
 
 import re
 import json
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
@@ -26,15 +33,15 @@ from core.plugin import BasePlugin, logger, register_tool, on, Priority
 from core.prompt_manager import Prompt
 
 
-# ──────────────────────────────────────────────
-#  Data Model
+#──────────────────────────────────────────────
+#Data Model
 # ──────────────────────────────────────────────
 
 @dataclass
 class WorldBookEntry:
     """单个世界书条目"""
 
-    # ── 基本信息 ──
+    #── 基本信息 ──
     name: str = "unnamed"
     keywords: List[str] = field(default_factory=list)
     content: str = ""
@@ -76,6 +83,19 @@ class WorldBookPlugin(BasePlugin):
         self.entries: List[WorldBookEntry] = []
         self.books: Dict[str, List[WorldBookEntry]] = {}
         self.data_dir: Optional[Path] = None
+        self._lock = asyncio.Lock()
+
+    # ============================================================
+    #  Utilities
+    # ============================================================
+
+    @staticmethod
+    def _safe_int(value, default: int) -> int:
+        """安全整数转换，失败时返回默认值"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     # ============================================================
     #  Lifecycle
@@ -94,7 +114,6 @@ class WorldBookPlugin(BasePlugin):
             self._create_example_book(books_dir)
 
         self._load_all_books()
-
         enabled = sum(1 for e in self.entries if e.enabled)
         logger.info(
             f"[WorldBook] 已加载 {len(self.entries)} 个条目"
@@ -107,8 +126,8 @@ class WorldBookPlugin(BasePlugin):
             )
 
     async def terminate(self):
-        self.entries.clear()
-        self.books.clear()
+        self.entries = []
+        self.books = {}
         logger.info("[WorldBook] 插件已终止")
 
     # ============================================================
@@ -125,14 +144,14 @@ class WorldBookPlugin(BasePlugin):
     def _create_example_book(self, books_dir: Path):
         data = {
             "book_name": "示例世界书",
-            "description": "修改此文件或在 books/ 目录下创建新的 .yaml / .json 文件",
+            "description": "修改此文件或在books/ 目录下创建新的.yaml / .json 文件",
             "entries": [
                 {
                     "name": "示例 - 常驻条目",
                     "keywords": [],
                     "content": (
                         "常驻条目始终注入上下文，无需关键词触发。\n"
-                        "将 enabled 改为 true 来启用此条目。"
+                        "将enabled 改为 true 来启用此条目。"
                     ),
                     "enabled": False,
                     "constant": True,
@@ -175,15 +194,16 @@ class WorldBookPlugin(BasePlugin):
                     "keywords": [],
                     "secondary_keywords": ["魔法"],
                     "content": (
-                        "当其他已激活条目的内容中包含二级关键词时，\n"
+                        "当用户对话或已激活条目的内容中包含二级关键词时，\n"
                         "此条目也会被连带激活。\n"
-                        "注意：二级关键词也会扫描用户的对话内容。"
+                        "注意：此条目本身没有主关键词，\n"
+                        "只能通过二级关键词在第二轮匹配中被激活。"
                     ),
                     "enabled": False,
                     "position": "system_note",
                     "insertion_order": 400,
                     "priority": 20,
-                    "comment": "二级关键词递归激活示例",
+                    "comment": "二级关键词递归激活示例（无主关键词，仅靠二级关键词激活）",
                 },
             ],
         }
@@ -212,37 +232,52 @@ class WorldBookPlugin(BasePlugin):
                 logger.error(f"[WorldBook] 创建示例失败：{e}")
 
     def _load_all_books(self):
-        self.entries.clear()
-        self.books.clear()
+        """加载所有世界书文件，使用原子替换避免并发问题"""
+        if self.data_dir is None:
+            logger.error("[WorldBook] 数据目录未初始化，无法加载世界书")
+            return
 
         books_dir = self.data_dir / "books"
         if not books_dir.exists():
+            self.entries = []
+            self.books = {}
             return
+
+        new_entries: List[WorldBookEntry] = []
+        new_books: Dict[str, List[WorldBookEntry]] = {}
 
         for fp in self._find_book_files(books_dir):
             try:
-                self._load_book_file(fp)
+                book_name, book_entries = self._load_book_file(fp)
+                if book_entries:
+                    new_books[book_name] = book_entries
+                    new_entries.extend(book_entries)
             except Exception as e:
                 logger.error(f"[WorldBook] 加载 '{fp.name}' 失败：{e}")
 
-    def _load_book_file(self, file_path: Path):
+        # 原子替换引用，避免迭代中被清空
+        self.entries = new_entries
+        self.books = new_books
+
+    def _load_book_file(self, file_path: Path) -> tuple:
+        """加载单个世界书文件，返回 (book_name, entries_list)"""
         suffix = file_path.suffix.lower()
         with file_path.open("r", encoding="utf-8") as f:
-            if suffix in (".yaml", ".yml"):
+            if suffix in(".yaml", ".yml"):
                 if not HAS_YAML:
                     logger.warning(f"[WorldBook] 跳过 '{file_path.name}'：未安装 PyYAML")
-                    return
+                    return file_path.stem, []
                 data = yaml.safe_load(f)
             else:
                 data = json.load(f)
 
         if not isinstance(data, dict):
-            return
+            return file_path.stem, []
 
         book_name = data.get("book_name", file_path.stem)
         raw_list = data.get("entries", [])
         if not isinstance(raw_list, list):
-            return
+            return book_name, []
 
         book_entries: List[WorldBookEntry] = []
         for idx, raw in enumerate(raw_list):
@@ -254,10 +289,21 @@ class WorldBookPlugin(BasePlugin):
             except Exception as e:
                 logger.warning(f"[WorldBook] '{book_name}' 条目 #{idx} 解析失败：{e}")
 
-        self.books[book_name] = book_entries
-        self.entries.extend(book_entries)
+        return book_name, book_entries
 
     def _parse_entry(self, raw: dict, idx: int, source: str) -> WorldBookEntry:
+        # scan_depth 类型安全校验
+        raw_depth = raw.get("scan_depth")
+        scan_depth = None
+        if raw_depth is not None:
+            try:
+                scan_depth = int(raw_depth)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"[WorldBook] 条目 '{raw.get('name', f'entry_{idx}')}' "
+                    f"的 scan_depth 无效: {raw_depth}，将使用全局默认值"
+                )
+
         return WorldBookEntry(
             name=str(raw.get("name", f"entry_{idx}")),
             keywords=self._to_str_list(raw.get("keywords", [])),
@@ -265,17 +311,17 @@ class WorldBookPlugin(BasePlugin):
             enabled=bool(raw.get("enabled", True)),
             comment=str(raw.get("comment", "")),
             constant=bool(raw.get("constant", False)),
-            scan_depth=raw.get("scan_depth"),
+            scan_depth=scan_depth,
             case_sensitive=bool(raw.get("case_sensitive", False)),
             match_whole_words=bool(raw.get("match_whole_words", False)),
             use_regex=bool(raw.get("use_regex", False)),
             secondary_keywords=self._to_str_list(raw.get("secondary_keywords", [])),
             exclude_recursion=bool(raw.get("exclude_recursion", False)),
             position=str(raw.get("position", "system_note")),
-            insertion_order=int(raw.get("insertion_order", 100)),
-            priority=int(raw.get("priority", 50)),
+            insertion_order=self._safe_int(raw.get("insertion_order"), 100),
+            priority=self._safe_int(raw.get("priority"), 50),
             group=str(raw.get("group", "")),
-            group_weight=int(raw.get("group_weight", 100)),
+            group_weight=self._safe_int(raw.get("group_weight"), 100),
             source_file=source,
         )
 
@@ -288,7 +334,7 @@ class WorldBookPlugin(BasePlugin):
         return []
 
     # ============================================================
-    #  Keyword Matching  (无变化)
+    #  Keyword Matching
     # ============================================================
 
     @staticmethod
@@ -324,7 +370,7 @@ class WorldBookPlugin(BasePlugin):
         return False
 
     # ============================================================
-    #  ★ 修复核心：文本提取与扫描
+    #  文本提取与扫描
     # ============================================================
 
     @staticmethod
@@ -348,15 +394,13 @@ class WorldBookPlugin(BasePlugin):
     def _extract_user_texts(
         self, messages: list, user_prompts: list
     ) -> List[str]:
-        """
-        ★ 关键修复：仅提取 role=user 的消息文本。
-        
-        排除 assistant / system / tool 消息，避免 AI 回复中的
+        """仅提取 role=user 的消息文本。
+        排除 assistant / system / tool消息，避免 AI 回复中的
         世界书内容造成下一轮循环触发。
         """
         texts: List[str] = []
 
-        # ── 历史消息：仅取 role=user ──
+        #── 历史消息：仅取role=user ──
         for msg in messages:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 content = self._extract_message_content(msg)
@@ -368,37 +412,35 @@ class WorldBookPlugin(BasePlugin):
             if hasattr(p, "content") and isinstance(p.content, str):
                 if p.content.strip():
                     texts.append(p.content)
-            elif isinstance(p, dict):
-                content = self._extract_message_content(p)
+                elif isinstance(p, dict):
+                    content = self._extract_message_content(p)
                 if content.strip():
                     texts.append(content)
-            elif isinstance(p, str) and p.strip():
-                texts.append(p)
+                elif isinstance(p, str) and p.strip():
+                    texts.append(p)
 
         return texts
 
     @staticmethod
     def _join_recent(texts: List[str], depth: int) -> str:
         """取最近 depth 条文本拼接"""
+        if not texts:
+            return ""
         recent = texts[-depth:] if len(texts) > depth else texts
         return "\n".join(recent)
 
     # ============================================================
-    #  ★ 修复核心：条目收集
+    #  条目收集
     # ============================================================
 
     def _collect_matches(
         self, user_texts: List[str], default_depth: int
     ) -> List[WorldBookEntry]:
         """
-        两轮匹配，支持条目级别 scan_depth。
-        
-        ★ 修复：
-          - 仅扫描用户消息，不包含 AI 回复
-          - 按条目各自的 scan_depth 构建扫描文本（带缓存）
+        两轮匹配，支持条目级别 scan_depth。仅扫描用户消息，不包含 AI 回复。
         """
         matched: List[WorldBookEntry] = []
-        match_reasons: Dict[str, str] = {}  # name → reason (调试用)
+        match_reasons: Dict[str, str] = {}
         seen: Set[int] = set()
 
         # 扫描文本缓存：depth → text
@@ -409,11 +451,15 @@ class WorldBookPlugin(BasePlugin):
                 scan_cache[depth] = self._join_recent(user_texts, depth)
             return scan_cache[depth]
 
+        # 获取当前 entries 的快照引用，避免迭代中被替换
+        current_entries = self.entries
+
         # ── 第一轮：常驻 + 关键词直接匹配 ──
-        for entry in self.entries:
+        for entry in current_entries:
             if not entry.enabled or not entry.content:
                 continue
 
+            # 常驻条目始终激活，不依赖用户文本
             if entry.constant:
                 if id(entry) not in seen:
                     matched.append(entry)
@@ -421,7 +467,8 @@ class WorldBookPlugin(BasePlugin):
                     match_reasons[entry.name] = "constant"
                 continue
 
-            if not entry.keywords:
+            # 非常驻条目需要关键词和用户文本
+            if not entry.keywords or not user_texts:
                 continue
 
             depth = entry.scan_depth if entry.scan_depth is not None else default_depth
@@ -442,13 +489,16 @@ class WorldBookPlugin(BasePlugin):
                     seen.add(id(entry))
                     match_reasons[entry.name] = f"keyword(depth={depth})"
 
-        # ── 第二轮：二级关键词递归 ──
-        if matched:
+            # ── 多轮递归：二级关键词 ──
+        max_rounds = self._safe_int(self.plugin_cfg.get("max_recursion_depth"), 3)
+        full_user_text = get_scan(default_depth) if user_texts else ""
+
+        for round_num in range(1, max_rounds + 1):
             activated_content = "\n".join(e.content for e in matched)
-            full_user_text = get_scan(default_depth)
             combined = full_user_text + "\n" + activated_content
 
-            for entry in self.entries:
+            new_this_round: List[WorldBookEntry] = []
+            for entry in current_entries:
                 if not entry.enabled or not entry.content:
                     continue
                 if id(entry) in seen or entry.exclude_recursion:
@@ -462,25 +512,32 @@ class WorldBookPlugin(BasePlugin):
                     entry.match_whole_words,
                     entry.use_regex,
                 ):
-                    matched.append(entry)
+                    new_this_round.append(entry)
                     seen.add(id(entry))
-                    match_reasons[entry.name] = "secondary_keyword"
+                    match_reasons[entry.name] = f"secondary(round={round_num})"
+
+            if not new_this_round:
+                break
+
+            matched.extend(new_this_round)
+            names = [e.name for e in new_this_round]
+            logger.info(f"[WorldBook] 递归第{round_num}轮激活: {names}")
 
         # 日志：显示匹配原因
         if match_reasons:
             reasons_str = ", ".join(
                 f"{name}({reason})" for name, reason in match_reasons.items()
             )
-            logger.debug(f"[WorldBook] 匹配详情：{reasons_str}")
+            logger.info(f"[WorldBook] 匹配详情：{reasons_str}")
 
         return matched
 
     # ============================================================
-    #  Budget & Limits  (基本无变化)
+    #  Budget & Limits
     # ============================================================
 
     def _apply_limits(self, entries: List[WorldBookEntry]) -> List[WorldBookEntry]:
-        max_per_group = int(self.plugin_cfg.get("max_entries_per_group", 10))
+        max_per_group = self._safe_int(self.plugin_cfg.get("max_entries_per_group"), 10)
 
         groups: Dict[str, List[WorldBookEntry]] = {}
         ungrouped: List[WorldBookEntry] = []
@@ -497,23 +554,23 @@ class WorldBookPlugin(BasePlugin):
 
         result.sort(key=lambda e: (-e.priority, e.insertion_order))
 
-        cap = int(self.plugin_cfg.get("max_entries", 20))
+        cap = self._safe_int(self.plugin_cfg.get("max_entries"), 20)
         if cap > 0 and len(result) > cap:
             result = result[:cap]
 
         return result
 
     def _apply_char_budget(self, entries: List[WorldBookEntry]) -> List[WorldBookEntry]:
-        max_chars = int(self.plugin_cfg.get("max_chars", 16000))
+        max_chars = self._safe_int(self.plugin_cfg.get("max_chars"), 16000)
         if max_chars <= 0:
             return entries
 
-        total = 0
+        total =0
         kept: List[WorldBookEntry] = []
         for e in entries:
             cost = len(e.name) + len(e.content) + 10
             if total + cost > max_chars:
-                logger.debug(f"[WorldBook] 字符预算用尽，跳过剩余条目")
+                logger.info(f"[WorldBook] 字符预算用尽，跳过剩余条目")
                 break
             kept.append(e)
             total += cost
@@ -529,16 +586,21 @@ class WorldBookPlugin(BasePlugin):
         if not self.entries:
             return
 
-        default_depth = int(self.plugin_cfg.get("scan_depth", 50))
+        default_depth = self._safe_int(self.plugin_cfg.get("scan_depth"), 50)
 
-        # ★ 修复：仅提取用户消息，不含 AI 回复
+        # 提取用户消息（不含 AI 回复）
         user_texts = self._extract_user_texts(
             request.messages, request.user_prompt
         )
-        if not user_texts:
+
+        # 即使没有用户文本，也要检查常驻条目
+        has_constants = any(
+            e.enabled and e.constant and e.content for e in self.entries
+        )
+        if not user_texts and not has_constants:
             return
 
-        # ★ 修复：传入用户文本列表，支持条目级 scan_depth
+        # 收集匹配条目（常驻条目不依赖 user_texts）
         matched = self._collect_matches(user_texts, default_depth)
         if not matched:
             return
@@ -589,7 +651,8 @@ class WorldBookPlugin(BasePlugin):
                 "character", "persona", "char",
             ):
                 return i
-        return 0
+        # 找不到人设时追加到末尾，避免插到关键系统指令之前
+        return len(prompts)
 
     # ============================================================
     #  Search
@@ -600,7 +663,9 @@ class WorldBookPlugin(BasePlugin):
     ) -> List[WorldBookEntry]:
         q = query.lower()
         hits: List[WorldBookEntry] = []
-        for e in self.entries:
+        # 使用快照引用
+        current_entries = self.entries
+        for e in current_entries:
             if not include_disabled and not e.enabled:
                 continue
             if q in e.name.lower():
@@ -611,7 +676,7 @@ class WorldBookPlugin(BasePlugin):
                 continue
             if q in e.content.lower():
                 hits.append(e)
-        return hits
+                return hits
 
     # ============================================================
     #  Tool Functions
@@ -647,10 +712,11 @@ class WorldBookPlugin(BasePlugin):
         description="重新加载所有世界书文件（文件修改后调用以刷新）。",
         params={
             "type": "object",
-            "properties": {},
-        },
+            "properties": {},},
     )
     async def world_book_reload(self, event) -> str:
+        if self.data_dir is None:
+            return "世界书重新加载失败：数据目录未初始化"
         try:
             self._load_all_books()
             enabled = sum(1 for e in self.entries if e.enabled)
