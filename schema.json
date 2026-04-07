@@ -28,5 +28,11 @@
     "default": "[World Book / 世界书 - 背景设定与参考知识]",
     "title": "注入标题",
     "description": "注入到系统提示中的标题文本"
+  },
+  "max_recursion_depth": {
+  "type": "number",
+  "default": 3,
+  "title": "最大递归深度",
+  "description": "递归检索最大层次数"
   }
 }
