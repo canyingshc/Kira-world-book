@@ -3,7 +3,7 @@ World Book Plugin for KiraAI
 =============================
 根据对话中的关键词自动将世界书条目注入 LLM 上下文。
 
-v1.2修复：
+v1.2.1修复：
   - 常驻条目在无用户文本时仍能注入
   - data_dir 空值防御
   - 并发 reload 安全（原子替换）
@@ -14,6 +14,7 @@ v1.2修复：
   - 支持条目级别 scan_depth，带缓存
   - 二级关键词仅基于用户文本 + 已激活条目内容匹配
   - 增加最大递归深度
+  - 修复了content 的作用域和逻辑缩进
 """
 
 import re
@@ -394,13 +395,10 @@ class WorldBookPlugin(BasePlugin):
     def _extract_user_texts(
         self, messages: list, user_prompts: list
     ) -> List[str]:
-        """仅提取 role=user 的消息文本。
-        排除 assistant / system / tool消息，避免 AI 回复中的
-        世界书内容造成下一轮循环触发。
-        """
+        """仅提取 role=user 的消息文本。"""
         texts: List[str] = []
 
-        #── 历史消息：仅取role=user ──
+        # ── 历史消息：仅取 role=user ──
         for msg in messages:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 content = self._extract_message_content(msg)
@@ -412,12 +410,12 @@ class WorldBookPlugin(BasePlugin):
             if hasattr(p, "content") and isinstance(p.content, str):
                 if p.content.strip():
                     texts.append(p.content)
-                elif isinstance(p, dict):
-                    content = self._extract_message_content(p)
+            elif isinstance(p, dict):
+                content = self._extract_message_content(p)
                 if content.strip():
                     texts.append(content)
-                elif isinstance(p, str) and p.strip():
-                    texts.append(p)
+            elif isinstance(p, str) and p.strip():
+                texts.append(p)
 
         return texts
 
